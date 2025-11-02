@@ -508,6 +508,8 @@ def spectralIndices(
     lambdaS2=2202.4,
     online=False,
     drop=False,
+    satellite_type=None,
+    band_map=None,
 ):
     """Computes one or more spectral indices (indices are added as bands) for an image
     collection from the Awesome List of Spectral Indices.
@@ -636,38 +638,442 @@ def spectralIndices(
     - Computing all indices:
 
     >>> S2.spectralIndices('all')
+    
+    Parameters for custom collections (OSI-style):
+    ------------------------------------------------
+    satellite_type : str, optional
+        Satellite type for custom collections. Options:
+        - 'Sentinel' or 'Sentinel-2' (maps to Sentinel-2)
+        - 'Landsat' or 'Landsat-8' or 'Landsat-9' (maps to Landsat)
+        - 'Planet' (maps to Planet)
+        If provided, will automatically map OSI-style band names to standard GEE names.
+    band_map : dict, optional
+        Custom band name mapping dictionary. Format: {custom_name: standard_name}
+        Example: {'blue': 'B2', 'green': 'B3', 'red': 'B4', 'nir': 'B8', ...}
+        If provided, takes precedence over satellite_type.
     """
-    return ee_extra.Spectral.core.spectralIndices(
-        self,
-        index,
-        G,
-        C1,
-        C2,
-        L,
-        cexp,
-        nexp,
-        alpha,
-        slope,
-        intercept,
-        gamma,
-        omega,
-        beta,
-        k,
-        fdelta,
-        epsilon,
-        kernel,
-        sigma,
-        p,
-        c,
-        lambdaN,
-        lambdaN2,
-        lambdaR,
-        lambdaG,
-        lambdaS1,
-        lambdaS2,
-        online,
-        drop,
-    )
+    import ee
+    
+    # Band mapping dictionaries for OSI-style collections
+    # Maps OSI custom band names to standard GEE band names
+    OSI_BAND_MAPPINGS = {
+        'Sentinel': {
+            'blue': 'B2',
+            'green': 'B3',
+            'red': 'B4',
+            'redE1': 'B5',
+            'redE2': 'B6',
+            'redE3': 'B7',
+            'nir': 'B8',
+            'redE4': 'B8A',
+            'swir1': 'B11',
+            'swir2': 'B12',
+            # Keep cloudM as-is (ee_extra doesn't need it)
+        },
+        'Landsat': {
+            'blue': 'SR_B2',
+            'green': 'SR_B3',
+            'red': 'SR_B4',
+            'nir': 'SR_B5',
+            'swir1': 'SR_B6',
+            'swir2': 'SR_B7',
+        },
+        'Planet': {
+            'blue': 'B',
+            'green': 'G',
+            'red': 'R',
+            'nir': 'N',
+        }
+    }
+    
+    # Platform mapping for ee_extra (maps OSI satellite types to ee_extra platform names)
+    # These must match the keys in ee_extra.Spectral.utils._get_expression_map's lookupPlatform dict
+    PLATFORM_MAP = {
+        'Sentinel': 'COPERNICUS/S2_SR',  # Use COPERNICUS/S2_SR for Sentinel-2
+        'Sentinel-2': 'COPERNICUS/S2_SR',
+        'Landsat': 'LANDSAT/LC08/C02/T1_L2',  # Default to Landsat-8 Collection 2 Level 2
+        'Landsat-8': 'LANDSAT/LC08/C02/T1_L2',
+        'Landsat-9': 'LANDSAT/LC09/C02/T1_L2',
+        'Planet': None,  # Planet may not be directly supported - would need custom handling
+    }
+    
+    # Determine if we need band mapping
+    needs_mapping = (satellite_type is not None) or (band_map is not None)
+    mapped_collection = self
+    reverse_map = None
+    original_band_names = None
+    
+    if needs_mapping:
+        # Get band mapping
+        if band_map is not None:
+            # Use provided band_map directly
+            forward_map = band_map
+        elif satellite_type in OSI_BAND_MAPPINGS:
+            # Use OSI-style mapping based on satellite_type
+            forward_map = OSI_BAND_MAPPINGS[satellite_type]
+        else:
+            # Try to auto-detect from band names
+            try:
+                first_image = ee.Image(self.first())
+                available_bands = first_image.bandNames().getInfo()
+                
+                # Check which mapping matches
+                for sat_type, mapping in OSI_BAND_MAPPINGS.items():
+                    if all(custom_band in available_bands for custom_band in list(mapping.keys())[:4]):  # Check first 4 bands
+                        forward_map = mapping
+                        satellite_type = sat_type
+                        break
+                else:
+                    forward_map = None
+            except:
+                forward_map = None
+        
+        if forward_map is not None:
+            # Get original band names
+            try:
+                first_image = ee.Image(self.first())
+                original_band_names = first_image.bandNames().getInfo()
+            except:
+                original_band_names = None
+            
+            # Create reverse mapping (standard -> custom)
+            reverse_map = {v: k for k, v in forward_map.items()}
+            
+            # Map custom names to standard names before calling ee_extra
+            # IMPORTANT: We need to rename bands, not select them, to preserve all other bands!
+            # Only rename bands that actually exist in the collection
+            try:
+                first_image = ee.Image(self.first())
+                available_bands = first_image.bandNames().getInfo()
+                
+                # Only map bands that exist in the collection
+                mapped_bands = [b for b in forward_map.keys() if b in available_bands]
+                standard_bands = [forward_map[b] for b in mapped_bands]
+                
+                if mapped_bands:
+                    # Rename bands: custom -> standard (preserve all other bands)
+                    # Calculate unmapped bands (bands to keep as-is) BEFORE the map function
+                    unmapped_bands_list = [b for b in available_bands if b not in mapped_bands]
+                    
+                    def rename_bands_for_ee_extra(img):
+                        # Create a new image starting with renamed bands
+                        new_img = None
+                        
+                        # Rename each mapped band
+                        for i in range(len(mapped_bands)):
+                            custom_name = mapped_bands[i]
+                            standard_name = standard_bands[i]
+                            # Select, rename, and prepare to add
+                            renamed_band = img.select([custom_name]).rename([standard_name])
+                            if new_img is None:
+                                new_img = renamed_band
+                            else:
+                                new_img = new_img.addBands(renamed_band)
+                        
+                        # Add back all bands that don't need renaming (preserves cloudM, NDVI, etc.)
+                        if unmapped_bands_list:
+                            kept_bands = img.select(unmapped_bands_list)
+                            if new_img is None:
+                                return kept_bands
+                            else:
+                                return new_img.addBands(kept_bands)
+                        else:
+                            return new_img
+                    
+                    mapped_collection = self.map(rename_bands_for_ee_extra)
+                else:
+                    # No bands to map, use original collection
+                    mapped_collection = self
+            except Exception as map_error:
+                # Fallback: If mapping fails, try simpler approach
+                # Just use the original collection and let ee_extra handle it
+                # (may fail if band names don't match, but at least we preserve bands)
+                mapped_collection = self
+    
+    # Patch _get_platform_STAC to handle None pltID for custom collections
+    try:
+        import ee_extra.STAC.utils as stac_utils
+        import ee_extra.Spectral.core as spectral_core
+        
+        # Save original function
+        original_get_platform = getattr(stac_utils, '_get_platform_STAC', None)
+        
+        # Check if we need to patch (only for custom collections)
+        if needs_mapping and satellite_type is not None:
+            # Capture satellite_type and PLATFORM_MAP in closure
+            captured_satellite_type = satellite_type
+            captured_platform_map = PLATFORM_MAP
+            
+            def patched_get_platform_STAC(args):
+                """Patched version that handles custom collections without system:id"""
+                # ALWAYS check for custom collection first if satellite_type is provided
+                # This prevents the original function from being called at all
+                if captured_satellite_type is not None and captured_satellite_type in captured_platform_map:
+                    platform_name = captured_platform_map[captured_satellite_type]
+                    if platform_name is None:
+                        raise ValueError(
+                            f"Platform '{captured_satellite_type}' is not directly supported by ee_extra. "
+                            f"Please use a supported satellite type or provide a custom band_map."
+                        )
+                    # Determine if it's Surface Reflectance (SR in name or Sentinel collections)
+                    is_sr = ('SR' in platform_name or 
+                            'S2' in platform_name or
+                            captured_satellite_type == 'Sentinel' or 
+                            captured_satellite_type == 'Sentinel-2')
+                    return {"platform": platform_name, "sr": is_sr}
+                
+                # Only try original function if we don't have satellite_type info
+                # This should not happen if needs_mapping is True, but included as safety
+                if original_get_platform:
+                    try:
+                        result = original_get_platform(args)
+                        return result
+                    except (TypeError, AttributeError, Exception) as e:
+                        # Catch TypeError from "_SR" in pltID where pltID is None
+                        error_msg = str(e).lower()
+                        if ("nonetype" in error_msg or 
+                            "not iterable" in error_msg or 
+                            "argument of type 'NoneType'" in error_msg):
+                            # If we have satellite_type, use it
+                            if captured_satellite_type is not None and captured_satellite_type in captured_platform_map:
+                                platform_name = captured_platform_map[captured_satellite_type]
+                                if platform_name is None:
+                                    raise ValueError(
+                                        f"Platform '{captured_satellite_type}' is not directly supported by ee_extra."
+                                    )
+                                is_sr = ('SR' in platform_name or 
+                                        'S2' in platform_name or
+                                        captured_satellite_type == 'Sentinel' or 
+                                        captured_satellite_type == 'Sentinel-2')
+                                return {"platform": platform_name, "sr": is_sr}
+                            # Otherwise, raise helpful error
+                            raise ValueError(
+                                f"Custom collection detected (no system:id). "
+                                f"Please provide satellite_type parameter (e.g., 'Sentinel', 'Landsat', 'Planet'). "
+                                f"Original error: {e}"
+                            )
+                        # Re-raise other exceptions
+                        raise
+                else:
+                    raise ValueError(
+                        "Could not determine platform. This appears to be a custom collection. "
+                        "Please provide satellite_type parameter (e.g., 'Sentinel', 'Landsat', 'Planet')."
+                    )
+            
+            # Patch both locations (ee_extra may import it locally)
+            # Since spectral_core imports _get_platform_STAC from stac_utils at module level,
+            # they should be the same function object, but we patch both to be safe
+            stac_utils._get_platform_STAC = patched_get_platform_STAC
+            # Also patch in Spectral.core (it imports from stac_utils, so this should work)
+            if hasattr(spectral_core, '_get_platform_STAC'):
+                spectral_core._get_platform_STAC = patched_get_platform_STAC
+            # Also check if it's imported directly in spectral_core namespace
+            import ee_extra.Spectral.core
+            if hasattr(ee_extra.Spectral.core, '_get_platform_STAC'):
+                ee_extra.Spectral.core._get_platform_STAC = patched_get_platform_STAC
+        
+        # Call ee_extra with mapped collection
+        # Wrap in try-except to catch TypeError from platform detection
+        try:
+            result = ee_extra.Spectral.core.spectralIndices(
+                mapped_collection,
+                index,
+                G,
+                C1,
+                C2,
+                L,
+                cexp,
+                nexp,
+                alpha,
+                slope,
+                intercept,
+                gamma,
+                omega,
+                beta,
+                k,
+                fdelta,
+                epsilon,
+                kernel,
+                sigma,
+                p,
+                c,
+                lambdaN,
+                lambdaN2,
+                lambdaR,
+                lambdaG,
+                lambdaS1,
+                lambdaS2,
+                online,
+                drop,
+            )
+        except TypeError as e:
+            # Catch TypeError: argument of type 'NoneType' is not iterable
+            # This happens when _get_platform_STAC tries "if '_SR' in pltID" where pltID is None
+            error_msg = str(e).lower()
+            if ("nonetype" in error_msg or 
+                "not iterable" in error_msg or 
+                "argument of type 'NoneType'" in error_msg):
+                # The patch didn't work - retry with explicit platform handling
+                if needs_mapping and satellite_type is not None and satellite_type in PLATFORM_MAP:
+                    # Re-apply patch more aggressively and retry
+                    platform_name = PLATFORM_MAP[satellite_type]
+                    if platform_name is None:
+                        raise ValueError(
+                            f"Platform '{satellite_type}' is not directly supported by ee_extra."
+                        )
+                    is_sr = ('SR' in platform_name or 
+                            'S2' in platform_name or
+                            satellite_type == 'Sentinel' or 
+                            satellite_type == 'Sentinel-2')
+                    
+                    # Force patch again
+                    def force_patch(args):
+                        return {"platform": platform_name, "sr": is_sr}
+                    
+                    stac_utils._get_platform_STAC = force_patch
+                    spectral_core._get_platform_STAC = force_patch
+                    if hasattr(ee_extra.Spectral.core, '_get_platform_STAC'):
+                        ee_extra.Spectral.core._get_platform_STAC = force_patch
+                    
+                    # Retry the call
+                    result = ee_extra.Spectral.core.spectralIndices(
+                        mapped_collection,
+                        index,
+                        G, C1, C2, L, cexp, nexp, alpha, slope, intercept,
+                        gamma, omega, beta, k, fdelta, epsilon, kernel, sigma,
+                        p, c, lambdaN, lambdaN2, lambdaR, lambdaG, lambdaS1, lambdaS2,
+                        online, drop,
+                    )
+                else:
+                    raise ValueError(
+                        f"Custom collection detected (no system:id). "
+                        f"Please provide satellite_type parameter (e.g., 'Sentinel', 'Landsat', 'Planet'). "
+                        f"Original error: {e}"
+                    )
+            else:
+                # Different TypeError, re-raise
+                raise
+        
+        # Restore original function
+        if original_get_platform:
+            stac_utils._get_platform_STAC = original_get_platform
+            if hasattr(spectral_core, '_get_platform_STAC'):
+                spectral_core._get_platform_STAC = original_get_platform
+        
+        # Map standard band names back to custom names (keep new indices as-is)
+        if needs_mapping and reverse_map is not None and original_band_names is not None:
+            # Get result band names
+            try:
+                result_first = ee.Image(result.first())
+                result_bands = result_first.bandNames().getInfo()
+            except:
+                result_bands = []
+            
+            # Identify which bands need renaming back (only original bands, not new indices)
+            # We need to rename individual bands and keep ALL bands (including new indices)
+            bands_to_rename = {}
+            bands_to_keep = []
+            
+            for band in result_bands:
+                if band in reverse_map and reverse_map[band] in original_band_names:
+                    # This is an original band that was renamed, needs to be renamed back
+                    bands_to_rename[band] = reverse_map[band]
+                else:
+                    # This is a new band (spectral index) - keep it as-is
+                    bands_to_keep.append(band)
+            
+            if bands_to_rename:
+                # Rename bands back while preserving ALL bands (including new indices)
+                # Use server-side operations only (no .getInfo() in map function)
+                
+                # Prepare lists for server-side operations
+                bands_to_rename_list = list(bands_to_rename.keys())
+                new_names_list = [bands_to_rename[old] for old in bands_to_rename_list]
+                
+                # Get list of bands that should be kept as-is (new indices)
+                # These are bands in result but not in reverse_map keys
+                all_result_bands_set = set(result_bands)
+                mapped_standard_bands_set = set(reverse_map.keys())
+                bands_to_keep_list = [b for b in all_result_bands_set if b not in mapped_standard_bands_set]
+                
+                def rename_back(img):
+                    # Get all bands as server-side list
+                    all_bands = img.bandNames()
+                    
+                    # Create list of bands to keep (server-side)
+                    # Bands that are NOT in the rename mapping
+                    bands_to_keep_ee = ee.List(bands_to_keep_list)
+                    
+                    # Select and rename bands that need renaming
+                    renamed_bands = []
+                    for old_name, new_name in zip(bands_to_rename_list, new_names_list):
+                        renamed_bands.append(img.select([old_name]).rename([new_name]))
+                    
+                    # Combine renamed bands
+                    if renamed_bands:
+                        combined_img = renamed_bands[0]
+                        for rb in renamed_bands[1:]:
+                            combined_img = combined_img.addBands(rb)
+                    else:
+                        combined_img = None
+                    
+                    # Add back all other bands (new indices)
+                    if bands_to_keep_list:
+                        kept_bands = img.select(bands_to_keep_list)
+                        if combined_img is None:
+                            return kept_bands
+                        else:
+                            return combined_img.addBands(kept_bands)
+                    else:
+                        return combined_img
+                
+                result = result.map(rename_back)
+        
+        return result
+        
+    except Exception as e:
+        # If patching fails, try direct call (might work for standard collections)
+        # Restore original function if it was patched
+        try:
+            if 'original_get_platform' in locals() and original_get_platform:
+                stac_utils._get_platform_STAC = original_get_platform
+                if hasattr(spectral_core, '_get_platform_STAC'):
+                    spectral_core._get_platform_STAC = original_get_platform
+        except:
+            pass
+        
+        # Fallback: direct call (may fail for custom collections)
+        return ee_extra.Spectral.core.spectralIndices(
+            mapped_collection if needs_mapping else self,
+            index,
+            G,
+            C1,
+            C2,
+            L,
+            cexp,
+            nexp,
+            alpha,
+            slope,
+            intercept,
+            gamma,
+            omega,
+            beta,
+            k,
+            fdelta,
+            epsilon,
+            kernel,
+            sigma,
+            p,
+            c,
+            lambdaN,
+            lambdaN2,
+            lambdaR,
+            lambdaG,
+            lambdaS1,
+            lambdaS2,
+            online,
+            drop,
+        )
 
 
 @extend(ee.imagecollection.ImageCollection)
