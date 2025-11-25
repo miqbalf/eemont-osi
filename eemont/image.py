@@ -1502,3 +1502,342 @@ def tasseledCap(self):
     >>> img = img.tasseledCap()
     """
     return ee_extra.Spectral.core.tasseledCap(self)
+
+
+@extend(ee.image.Image)
+def spectra_indices(
+    self,
+    index,
+    band_map=None,
+    G=2.5,
+    C1=6.0,
+    C2=7.5,
+    L=1.0,
+    cexp=1.16,
+    nexp=2.0,
+    alpha=0.1,
+    slope=1.0,
+    intercept=0.0,
+    gamma=1.0,
+    omega=2.0,
+    beta=0.05,
+    k=0.0,
+    fdelta=0.581,
+    epsilon=1.0,
+    drop=False,
+):
+    """Computes spectral indices directly from formulas for custom images.
+    
+    This method bypasses ee_extra's internal band mapping and computes indices
+    directly from formulas, making it suitable for custom images with non-standard
+    band names.
+    
+    Alias: You can also use `.computeSpectralIndices()` (same method).
+    
+    Parameters
+    ----------
+    self : ee.Image
+        Image to compute indices on. Must be scaled to [0,1].
+    index : str | list[str]
+        Index or list of indices to compute from the awesome list.
+    band_map : dict, optional
+        Mapping from standard band names to actual band names in the image.
+        Standard names: 'nir', 'red', 'green', 'blue', 'swir1', 'swir2', 
+        'redE1', 'redE2', 'redE3', 'redE4'.
+        Example: {'nir': 'B8', 'red': 'B4', 'green': 'B3', 'blue': 'B2', 'redE1': 'B5'}
+        If None, will try to auto-detect from band names.
+    G : float, default = 2.5
+        Gain factor for EVI.
+    C1 : float, default = 6.0
+        Coefficient 1 for EVI.
+    C2 : float, default = 7.5
+        Coefficient 2 for EVI.
+    L : float, default = 1.0
+        Canopy background adjustment for EVI/SAVI.
+    cexp : float, default = 1.16
+        Exponent for OCVI.
+    nexp : float, default = 2.0
+        Exponent for GDVI.
+    alpha : float, default = 0.1
+        Weighting coefficient for WDRVI.
+    slope : float, default = 1.0
+        Soil line slope.
+    intercept : float, default = 0.0
+        Soil line intercept.
+    gamma : float, default = 1.0
+        Weighting coefficient for ARVI.
+    omega : float, default = 2.0
+        Weighting coefficient for MBWI.
+    beta : float, default = 0.05
+        Calibration parameter for NDSIns.
+    k : float, default = 0.0
+        Slope parameter for NIRvH2.
+    fdelta : float, default = 0.581
+        Adjustment factor for SEVI.
+    epsilon : float, default = 1.0
+        Adjustment constant for EBI.
+    drop : bool, default = False
+        Whether to drop all bands except the new spectral indices.
+    
+    Returns
+    -------
+    ee.Image
+        Image with the computed spectral index, or indices, as new bands.
+    
+    Examples
+    --------
+    >>> import ee, eemont
+    >>> ee.Initialize()
+    >>> # Custom image with Planet band names
+    >>> img = ee.Image.loadGeoTIFF('gs://bucket/image.tif')
+    >>> # Map standard names to actual band names
+    >>> band_map = {'nir': 'B8', 'red': 'B4', 'green': 'B3', 'blue': 'B2', 'redE1': 'B5'}
+    >>> # Compute indices directly from formulas
+    >>> img_with_indices = img.spectra_indices(
+    ...     index=['NDVI', 'EVI', 'SAVI'],
+    ...     band_map=band_map,
+    ...     G=2.5, C1=6.0, C2=7.5, L=1.0
+    ... )
+    """
+    import ee_extra.Spectral.core as spec_core
+    import re
+    
+    # Normalize index to list
+    if isinstance(index, str):
+        index = [index]
+    
+    # Get indices dictionary
+    # spec_core.indices() may return a Box object or dict-like object
+    indices_dict_raw = spec_core.indices(online=False)
+    
+    # Convert to regular dict if needed
+    if hasattr(indices_dict_raw, 'to_dict'):
+        indices_dict = indices_dict_raw.to_dict()
+    elif isinstance(indices_dict_raw, dict):
+        indices_dict = indices_dict_raw
+    else:
+        # Try to convert Box or similar object
+        try:
+            indices_dict = dict(indices_dict_raw)
+        except (TypeError, ValueError):
+            # Fallback: create dict from items
+            indices_dict = {k: indices_dict_raw[k] for k in indices_dict_raw.keys()}
+    
+    # Get list of available keys for case-insensitive lookup
+    # Handle both dict.keys() and Box.keys() or similar
+    try:
+        available_keys = list(indices_dict.keys())
+    except (AttributeError, TypeError):
+        # Fallback: try to get keys from raw object
+        available_keys = list(indices_dict_raw.keys()) if hasattr(indices_dict_raw, 'keys') else []
+    
+    # Auto-detect band mapping if not provided
+    if band_map is None:
+        try:
+            available_bands = self.bandNames().getInfo()
+            band_map = {}
+            
+            # Common mappings (try to detect)
+            band_name_lower = [b.lower() for b in available_bands]
+            
+            # NIR
+            for nir_name in ['nir', 'b8', 'near_infrared', 'nearinfrared']:
+                if nir_name in band_name_lower:
+                    idx = band_name_lower.index(nir_name)
+                    band_map['nir'] = available_bands[idx]
+                    break
+            
+            # Red
+            for red_name in ['red', 'b4', 'r']:
+                if red_name in band_name_lower:
+                    idx = band_name_lower.index(red_name)
+                    band_map['red'] = available_bands[idx]
+                    break
+            
+            # Green
+            for green_name in ['green', 'b3', 'g']:
+                if green_name in band_name_lower:
+                    idx = band_name_lower.index(green_name)
+                    band_map['green'] = available_bands[idx]
+                    break
+            
+            # Blue
+            for blue_name in ['blue', 'b2', 'b']:
+                if blue_name in band_name_lower:
+                    idx = band_name_lower.index(blue_name)
+                    band_map['blue'] = available_bands[idx]
+                    break
+            
+            # Red Edge 1
+            for re1_name in ['rede1', 'rede', 'rededge1', 'red_edge1', 'b5', 're1']:
+                if re1_name in band_name_lower:
+                    idx = band_name_lower.index(re1_name)
+                    band_map['redE1'] = available_bands[idx]
+                    break
+        except:
+            band_map = {}
+    
+    # Standard band name mapping (from formula abbreviations to standard names)
+    standard_band_mapping = {
+        'N': 'nir',
+        'R': 'red',
+        'G': 'green',
+        'B': 'blue',
+        'S1': 'swir1',
+        'S2': 'swir2',
+        'RE1': 'redE1',
+        'RE2': 'redE2',
+        'RE3': 'redE3',
+        'RE4': 'redE4',
+    }
+    
+    result_img = self if not drop else None
+    
+    # Process each index
+    for idx_name in index:
+        # Try to find the index (case-insensitive lookup)
+        idx_name_upper = idx_name.upper()
+        idx_key = None
+        
+        # First try exact match (original case)
+        if idx_name in available_keys:
+            idx_key = idx_name
+        # Then try uppercase
+        elif idx_name_upper in available_keys:
+            idx_key = idx_name_upper
+        else:
+            # Try to find case-insensitive match
+            for key in available_keys:
+                if key.upper() == idx_name_upper:
+                    idx_key = key
+                    break
+        
+        if idx_key is None:
+            warnings.warn(f"Index '{idx_name}' not found in awesome list. Available similar: {[k for k in available_keys if idx_name.upper() in k.upper()][:5]}. Skipping.")
+            continue
+        
+        # Get index info - handle both dict access and Box object access
+        try:
+            idx_info = indices_dict[idx_key] if isinstance(indices_dict, dict) else indices_dict_raw[idx_key]
+            # Convert to dict if it's a Box or similar object
+            if hasattr(idx_info, 'to_dict'):
+                idx_info = idx_info.to_dict()
+            elif not isinstance(idx_info, dict):
+                idx_info = dict(idx_info) if hasattr(idx_info, '__dict__') else idx_info
+        except (KeyError, TypeError) as e:
+            warnings.warn(f"Could not access index info for '{idx_name}': {e}. Skipping.")
+            continue
+        formula_str = idx_info.get('formula', '')
+        
+        if not formula_str:
+            warnings.warn(f"Index '{idx_name}' has no formula. Skipping.")
+            continue
+        
+        try:
+            # Get required bands from index info
+            required_bands = idx_info.get('bands', [])
+            
+            # Map formula abbreviations to actual band names
+            band_vars = {}
+            for abbrev, std_name in standard_band_mapping.items():
+                if abbrev in required_bands or abbrev in formula_str:
+                    if std_name in band_map:
+                        # Get the actual band name from the image
+                        actual_band = band_map[std_name]
+                        # Create EE band variable
+                        band_vars[abbrev] = self.select([actual_band])
+                    else:
+                        # Band not available - skip this index
+                        warnings.warn(
+                            f"Index '{idx_name}' requires band '{std_name}' ({abbrev}), "
+                            f"but it's not in band_map and not found in image. Skipping."
+                        )
+                        band_vars = None
+                        break
+            
+            if band_vars is None:
+                continue
+            
+            # Prepare parameters dictionary
+            # Include both uppercase and lowercase versions (some formulas use lowercase)
+            params = {
+                'G': G, 'g': G,  # Gain factor (some formulas use lowercase g)
+                'C1': C1, 'c1': C1,
+                'C2': C2, 'c2': C2,
+                'L': L, 'l': L,
+                'cexp': cexp, 'CEXP': cexp,
+                'nexp': nexp, 'NEXP': nexp,
+                'alpha': alpha, 'ALPHA': alpha,
+                'slope': slope, 'SLOPE': slope,
+                'intercept': intercept, 'INTERCEPT': intercept,
+                'gamma': gamma, 'GAMMA': gamma,
+                'omega': omega, 'OMEGA': omega,
+                'beta': beta, 'BETA': beta,
+                'k': k, 'K': k,
+                'fdelta': fdelta, 'FDELTA': fdelta,
+                'epsilon': epsilon, 'EPSILON': epsilon,
+            }
+            
+            # Convert formula to Earth Engine expression format
+            # ee.Image.expression() requires variable names to be lowercase and simple
+            expression_vars = {}
+            expression_formula = formula_str
+            
+            # Replace parameters first (to avoid conflicts with band names)
+            # Sort by length (longest first) to avoid partial matches
+            sorted_params = sorted(params.items(), key=lambda x: len(x[0]), reverse=True)
+            for param_name, param_value in sorted_params:
+                # Use word boundaries, but also handle cases where param is at start/end or in parentheses
+                # Pattern: word boundary OR start of string OR after non-word char, then param, then word boundary OR end OR before non-word char
+                pattern = r'(?<![a-zA-Z0-9_])' + re.escape(param_name) + r'(?![a-zA-Z0-9_])'
+                expression_formula = re.sub(pattern, str(param_value), expression_formula)
+            
+            # Replace band abbreviations with variable names for expression()
+            # Sort by length (longest first) to avoid partial matches (e.g., RE1 before R)
+            sorted_abbrevs = sorted(standard_band_mapping.keys(), key=len, reverse=True)
+            for abbrev in sorted_abbrevs:
+                if abbrev in band_vars:
+                    # Use lowercase variable name for expression (required by EE)
+                    var_name = abbrev.lower()
+                    expression_vars[var_name] = band_vars[abbrev]
+                    pattern = r'\b' + re.escape(abbrev) + r'\b'
+                    expression_formula = re.sub(pattern, var_name, expression_formula)
+            
+            # Evaluate using ee.Image.expression() which is safe and efficient
+            try:
+                index_band = self.expression(expression_formula, expression_vars)
+            except Exception as e:
+                warnings.warn(
+                    f"Failed to evaluate formula for '{idx_name}' using expression(): {e}. "
+                    f"Formula: {formula_str}. Expression: {expression_formula}. Skipping."
+                )
+                continue
+            
+            # Rename the band to the index name
+            index_band = index_band.rename([idx_name])
+            
+            # Add to result
+            if result_img is None:
+                result_img = index_band
+            else:
+                result_img = result_img.addBands(index_band)
+                
+        except Exception as e:
+            warnings.warn(f"Error computing index '{idx_name}': {e}. Skipping.")
+            continue
+    
+    if result_img is None:
+        # No indices were computed, return original image
+        return self
+    
+    # Ensure all bands have the same data type (Float32) for export compatibility
+    result_img = result_img.toFloat()
+    
+    return result_img
+
+
+# Alias for backward compatibility and convenience
+@extend(ee.image.Image)
+def computeSpectralIndices(self, *args, **kwargs):
+    """Alias for spectra_indices(). See spectra_indices() for documentation."""
+    return self.spectra_indices(*args, **kwargs)
