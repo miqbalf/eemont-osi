@@ -744,6 +744,19 @@ def spectralIndices(
             except:
                 forward_map = None
         
+        # Create complete reverse mapping EARLY if satellite_type is provided
+        # This ensures reverse mapping works even if forward mapping has issues
+        if needs_mapping and satellite_type is not None and satellite_type in OSI_BAND_MAPPINGS:
+            # Create complete reverse map from the full OSI_BAND_MAPPINGS dictionary
+            # This includes ALL possible mappings, not just the ones originally present
+            complete_forward_map = OSI_BAND_MAPPINGS[satellite_type]
+            reverse_map = {v: k for k, v in complete_forward_map.items()}
+        elif forward_map is not None:
+            # Fallback: Create reverse map from forward_map if satellite_type mapping not available
+            reverse_map = {v: k for k, v in forward_map.items()}
+        else:
+            reverse_map = None
+        
         if forward_map is not None:
             # Check if this is an identity mapping (no actual renaming needed)
             is_identity = all(k == v for k, v in forward_map.items())
@@ -773,9 +786,7 @@ def spectralIndices(
                     mapped_bands = [b for b in forward_map.keys() if b in available_bands]
                     standard_bands = [forward_map[b] for b in mapped_bands]
                     
-                    # CRITICAL: Create reverse mapping ONLY from bands that were actually mapped forward
-                    # This ensures reverse_map doesn't contain bands like B6 that don't exist in the original image
-                    reverse_map = {standard_bands[i]: mapped_bands[i] for i in range(len(mapped_bands))}
+                    # Note: reverse_map is already created above, so we don't recreate it here
                     
                     if mapped_bands:
                         # Rename bands: custom -> standard (preserve all other bands)
@@ -991,11 +1002,15 @@ def spectralIndices(
         # Skip reverse mapping if it's an identity mapping (standard -> standard)
         is_identity_mapping = reverse_map is not None and all(k == v for k, v in reverse_map.items())
         
-        if needs_mapping and reverse_map is not None and original_band_names is not None and not is_identity_mapping:
+        # Apply reverse mapping if we have a reverse_map (don't require original_band_names)
+        # This ensures ALL Sentinel bands get reverse-mapped back to OSI names
+        if needs_mapping and reverse_map is not None and not is_identity_mapping:
             # Get result band names
             try:
                 result_first = ee.Image(result.first())
                 result_bands = result_first.bandNames().getInfo()
+                # Debug: Print reverse mapping info
+                print(f"🔄 Reverse mapping: Found {len(reverse_map)} mappings, {len(result_bands)} bands in result")
             except:
                 result_bands = []
             
@@ -1009,106 +1024,60 @@ def spectralIndices(
             # Filter reverse_map to only include bands that exist in result
             existing_reverse_map = {k: v for k, v in reverse_map.items() if k in result_bands}
             
+            # Identify spectral indices (these are new bands that should NOT be renamed)
+            # Spectral indices are typically uppercase (EVI, NDVI, NBR, etc.)
+            # and are NOT in the reverse_map
+            spectral_indices = set()
             for band in result_bands:
-                if band in existing_reverse_map and existing_reverse_map[band] in original_band_names:
-                    # This is an original band that was renamed, needs to be renamed back
+                # Check if this is a spectral index (not in reverse_map and typically uppercase)
+                if band not in existing_reverse_map:
+                    spectral_indices.add(band)
+            
+            for band in result_bands:
+                if band in existing_reverse_map:
+                    # This is a Sentinel band that should be reverse-mapped to OSI name
+                    # Reverse-map ALL Sentinel bands, not just those in original_band_names
+                    # (when drop=False, ee_extra may add bands like B6, B7, B8A that weren't originally present)
                     bands_to_rename[band] = existing_reverse_map[band]
                 else:
                     # This is a new band (spectral index) - keep it as-is
                     bands_to_keep.append(band)
             
             if bands_to_rename:
-                # Rename bands back while preserving ALL bands (including new indices)
-                # Use server-side operations only (no .getInfo() in map function)
-                
-                # Prepare lists for server-side operations
+                # Direct approach: build result by selecting and renaming bands individually
+                # Prepare the rename mapping
                 bands_to_rename_list = list(bands_to_rename.keys())
                 new_names_list = [bands_to_rename[old] for old in bands_to_rename_list]
                 
-                # Convert to ee.List for server-side use
-                bands_to_rename_ee = ee.List(bands_to_rename_list)
-                new_names_ee = ee.List(new_names_list)
-                
-                # Get list of bands that should be kept as-is (new indices)
-                # These are bands in result but not in reverse_map keys
-                all_result_bands_set = set(result_bands)
-                mapped_standard_bands_set = set(reverse_map.keys())
-                bands_to_keep_list = [b for b in all_result_bands_set if b not in mapped_standard_bands_set]
-                
                 def rename_back(img):
-                    # Get all bands as server-side list (these are the ONLY bands that exist)
-                    all_bands = img.bandNames()
+                    """Rename Sentinel bands back to OSI names - use select with Python lists"""
+                    # Use Python lists directly - we know which bands exist from result_bands
+                    # This is much simpler and more reliable
                     
-                    # CRITICAL: Filter bands_to_rename_list to only include bands that actually exist
-                    # This is the key fix - we only process bands that exist in the image
-                    # Use iteration to build the list of existing bands to rename (avoids filter serialization issues)
-                    def check_band_in_list(band, acc):
-                        """Check if band is in bands_to_rename_ee and add to accumulator if so."""
-                        is_in_list = bands_to_rename_ee.contains(band)
-                        return ee.Algorithms.If(
-                            is_in_list,
-                            ee.Algorithms.If(
-                                ee.Algorithms.IsEqual(acc, None),
-                                ee.List([band]),
-                                acc.add(band)
-                            ),
-                            acc
-                        )
+                    # Select and rename bands that need renaming using select(old_names, new_names)
+                    # This is the correct Earth Engine way to rename bands!
+                    if bands_to_rename_list:
+                        renamed_img = img.select(bands_to_rename_list, new_names_list)
+                    else:
+                        renamed_img = None
                     
-                    existing_bands_to_rename_list = all_bands.iterate(
-                        lambda band, acc: check_band_in_list(band, acc),
-                        None
-                    )
+                    # Get kept bands (spectral indices)
+                    if bands_to_keep:
+                        kept_img = img.select(bands_to_keep)
+                    else:
+                        kept_img = None
                     
-                    # Convert to list (handle None case)
-                    existing_bands_to_rename = ee.Algorithms.If(
-                        ee.Algorithms.IsEqual(existing_bands_to_rename_list, None),
-                        ee.List([]),
-                        existing_bands_to_rename_list
-                    )
-                    
-                    # Get bands to keep (all existing bands except those we're renaming)
-                    # Use existing_bands_to_rename (not bands_to_rename_ee) to ensure we only exclude existing bands
-                    bands_to_keep_ee = all_bands.removeAll(existing_bands_to_rename)
-                    
-                    # Start with bands that should be kept as-is (new indices + unmapped original bands)
-                    result_img = img.select(bands_to_keep_ee)
-                    
-                    # Rename existing bands that need renaming (server-side iteration)
-                    def rename_existing_band(acc, band_name):
-                        # Find the index of this band in bands_to_rename_list
-                        idx = bands_to_rename_ee.indexOf(band_name)
-                        # Get the corresponding new name
-                        new_name = new_names_ee.get(idx)
-                        # Rename the band (band_name is guaranteed to exist because it's from existing_bands_to_rename)
-                        renamed_band = img.select([band_name]).rename([new_name])
-                        # Add to accumulator
-                        return ee.Algorithms.If(
-                            ee.Algorithms.IsEqual(acc, None),
-                            renamed_band,
-                            acc.addBands(renamed_band)
-                        )
-                    
-                    # Process only existing bands (this ensures B6 is skipped if it doesn't exist)
-                    renamed_combined = existing_bands_to_rename.iterate(
-                        lambda band, acc: rename_existing_band(acc, band),
-                        None
-                    )
-                    
-                    # Combine with kept bands
-                    result_img = ee.Algorithms.If(
-                        ee.Algorithms.IsEqual(renamed_combined, None),
-                        result_img,
-                        result_img.addBands(renamed_combined)
-                    )
-                    
-                    # Return result (or original image if nothing was processed)
-                    return ee.Algorithms.If(
-                        ee.Algorithms.IsEqual(result_img, None),
-                        img,  # Return original if nothing to rename
-                        result_img
-                    )
+                    # Combine: kept + renamed (order: kept first, then renamed)
+                    if kept_img is not None and renamed_img is not None:
+                        return kept_img.addBands(renamed_img)
+                    elif renamed_img is not None:
+                        return renamed_img
+                    elif kept_img is not None:
+                        return kept_img
+                    else:
+                        return img  # Fallback
                 
+                # Apply the renaming
                 result = result.map(rename_back)
         
         return result

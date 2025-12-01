@@ -784,6 +784,8 @@ def index(
 def spectralIndices(
     self,
     index="NDVI",
+    satellite_type=None,
+    band_map=None,
     G=2.5,
     C1=6.0,
     C2=7.5,
@@ -939,38 +941,86 @@ def spectralIndices(
     - Computing all indices:
 
     >>> S2.spectralIndices('all')
+    
+    - Computing indices with satellite_type for OSI-style band mapping:
+    
+    >>> custom_img.spectralIndices(['NDVI', 'EVI'], satellite_type='Sentinel', drop=False)
     """
-    return ee_extra.Spectral.core.spectralIndices(
-        self,
-        index,
-        G,
-        C1,
-        C2,
-        L,
-        cexp,
-        nexp,
-        alpha,
-        slope,
-        intercept,
-        gamma,
-        omega,
-        beta,
-        k,
-        fdelta,
-        epsilon,
-        kernel,
-        sigma,
-        p,
-        c,
-        lambdaN,
-        lambdaN2,
-        lambdaR,
-        lambdaG,
-        lambdaS1,
-        lambdaS2,
-        online,
-        drop,
-    )
+    # If satellite_type or band_map is provided, use ImageCollection method for band mapping
+    if satellite_type is not None or band_map is not None:
+        # Wrap single image in ImageCollection
+        img_col = ee.ImageCollection([self])
+        # Call ImageCollection.spectralIndices which handles OSI mapping
+        result_col = img_col.spectralIndices(
+            index=index,
+            satellite_type=satellite_type,
+            band_map=band_map,
+            G=G,
+            C1=C1,
+            C2=C2,
+            L=L,
+            cexp=cexp,
+            nexp=nexp,
+            alpha=alpha,
+            slope=slope,
+            intercept=intercept,
+            gamma=gamma,
+            omega=omega,
+            beta=beta,
+            k=k,
+            fdelta=fdelta,
+            epsilon=epsilon,
+            kernel=kernel,
+            sigma=sigma,
+            p=p,
+            c=c,
+            lambdaN=lambdaN,
+            lambdaN2=lambdaN2,
+            lambdaR=lambdaR,
+            lambdaG=lambdaG,
+            lambdaS1=lambdaS1,
+            lambdaS2=lambdaS2,
+            online=online,
+            drop=drop,
+        )
+        # Extract the first (and only) image from the collection
+        result_img = ee.Image(result_col.first())
+        # Copy properties from original image
+        result_img = result_img.copyProperties(self, self.propertyNames())
+        return result_img
+    else:
+        # No mapping needed, use direct ee_extra call
+        return ee_extra.Spectral.core.spectralIndices(
+            self,
+            index,
+            G,
+            C1,
+            C2,
+            L,
+            cexp,
+            nexp,
+            alpha,
+            slope,
+            intercept,
+            gamma,
+            omega,
+            beta,
+            k,
+            fdelta,
+            epsilon,
+            kernel,
+            sigma,
+            p,
+            c,
+            lambdaN,
+            lambdaN2,
+            lambdaR,
+            lambdaG,
+            lambdaS1,
+            lambdaS2,
+            online,
+            drop,
+        )
 
 
 @extend(ee.image.Image)
