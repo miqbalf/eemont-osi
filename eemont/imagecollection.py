@@ -658,6 +658,7 @@ def spectralIndices(
     # Maps OSI custom band names to standard GEE band names
     OSI_BAND_MAPPINGS = {
         'Sentinel': {
+            'alpha': 'B1',
             'blue': 'B2',
             'green': 'B3',
             'red': 'B4',
