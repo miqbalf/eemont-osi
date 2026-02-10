@@ -1,0 +1,17 @@
+# Windows / ArcGIS Pro compatible requirements.
+#
+# Use this file when installing inside ArcGIS Pro's Python environment on Windows.
+# It adds ArcGIS Python API compatibility pins for `pyarrow` and `pywin32`.
+
+beautifulsoup4
+earthengine-api
+ee_extra
+geopy
+numpy
+pandas
+python-box
+requests
+
+# ArcGIS Pro compatibility pins (ArcGIS Python API 2.4.x)
+pyarrow>=17,<21
+pywin32>=223
